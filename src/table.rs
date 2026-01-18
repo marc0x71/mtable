@@ -1,7 +1,7 @@
 #![allow(unused)]
 
-use crate::error::TableError;
-use std::{collections::HashSet, fmt::Debug};
+use crate::error::{LexerError, TableError};
+use std::{collections::HashSet, fmt::Debug, marker::PhantomData};
 
 #[derive(Debug)]
 struct Node<T> {
@@ -16,10 +16,18 @@ impl<T: Clone> Node<T> {
         }
     }
 
-    fn set_children(&mut self, index: usize, child: usize) {
+    fn set_children(&mut self, index: usize, child: usize) -> Result<(), TableError<T>> {
         if let Some(c) = self.children.get_mut(index) {
+            if let Some(existing) = *c
+                && existing != child
+            {
+                return Err(TableError::AmbiguousPattern(
+                    char::from_u32(child as u32).unwrap_or_default(),
+                ));
+            }
             *c = Some(child);
         }
+        Ok(())
     }
 
     fn get_children(&self, index: usize) -> Option<&usize> {
@@ -40,6 +48,10 @@ impl<T: Clone> Node<T> {
 
     fn get_value(&self) -> Option<&T> {
         self.value.as_ref()
+    }
+
+    fn has_value(&self) -> bool {
+        self.value.is_some()
     }
 }
 
@@ -154,6 +166,80 @@ impl<T: Debug + Clone> Table<T> {
             }
         }
         Ok(self.nodes[current].get_value())
+    }
+
+    pub fn lexer<'a>(&'a self, s: &'a str) -> Result<TableIterator<'a, T>, LexerError> {
+        if !s.is_ascii() {
+            return Err(LexerError::InvalidString(s.to_string()));
+        }
+        Ok(TableIterator {
+            table: self,
+            input: s,
+            index: 0,
+            _phantom: PhantomData,
+        })
+    }
+}
+
+pub struct TableIterator<'a, T> {
+    table: &'a Table<T>,
+    input: &'a str,
+    index: usize,
+    _phantom: PhantomData<T>,
+}
+
+impl<'a, T: Clone> Iterator for TableIterator<'a, T> {
+    type Item = Result<(&'a T, &'a str), LexerError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index >= self.input.len() {
+            return None;
+        }
+        let mut node_id = 0;
+        let mut progress = self.index;
+        let mut last_match = vec![];
+        loop {
+            if progress >= self.input.len() {
+                return match last_match.pop() {
+                    Some((last_index, value)) => {
+                        let content = &self.input[self.index..last_index + 1];
+                        self.index = last_index + 1;
+                        Some(Ok((value, content)))
+                    }
+                    None => Some(Err(LexerError::UnexpectedEnd {
+                        position: self.index,
+                    })),
+                };
+            }
+            let ch = self.input.as_bytes()[progress];
+            let pos = match self.table.alphabet.find(ch as char) {
+                Some(p) => p,
+                None => {
+                    return Some(Err(LexerError::UnknownChar {
+                        char: ch as char,
+                        position: progress,
+                    }));
+                }
+            };
+            if let Some(next) = self.table.nodes[node_id].get_children(pos) {
+                if self.table.nodes[*next].has_value() {
+                    last_match.push((progress, self.table.nodes[*next].get_value().unwrap()));
+                }
+                progress += 1;
+                node_id = *next;
+            } else {
+                return match last_match.pop() {
+                    Some((last_progress, value)) => {
+                        let content = &self.input[self.index..last_progress + 1];
+                        self.index = last_progress + 1;
+                        Some(Ok((value, content)))
+                    }
+                    None => Some(Err(LexerError::UnexpectedEnd {
+                        position: self.index,
+                    })),
+                };
+            }
+        }
     }
 }
 
@@ -772,5 +858,813 @@ mod tests {
 
         // Node should point to itself
         assert_eq!(first_node, loop_target);
+    }
+
+    // ========================================================================
+    // BASIC TOKENIZATION
+    // ========================================================================
+
+    #[test]
+    fn lexer_basic_expression() {
+        #[derive(Debug, Clone, PartialEq)]
+        enum Kind {
+            Number,
+            Add,
+            Sub,
+            Mul,
+            Div,
+        }
+
+        let mut t = Table::new("0123456789+-*/".to_string());
+        t.add("[0123456789]+", Kind::Number).unwrap();
+        t.add("+", Kind::Add).unwrap();
+        t.add("-", Kind::Sub).unwrap();
+        t.add("*", Kind::Mul).unwrap();
+        t.add("/", Kind::Div).unwrap();
+
+        let iter = t.lexer("1+2*3").unwrap();
+        let tokens: Vec<_> = iter.collect::<Result<_, _>>().unwrap();
+
+        assert_eq!(tokens.len(), 5);
+        assert_eq!(tokens[0], (&Kind::Number, "1"));
+        assert_eq!(tokens[1], (&Kind::Add, "+"));
+        assert_eq!(tokens[2], (&Kind::Number, "2"));
+        assert_eq!(tokens[3], (&Kind::Mul, "*"));
+        assert_eq!(tokens[4], (&Kind::Number, "3"));
+    }
+
+    #[test]
+    fn lexer_single_token() {
+        #[derive(Debug, Clone, PartialEq)]
+        enum Kind {
+            Word,
+        }
+
+        let mut t = Table::new("abcdefghijklmnopqrstuvwxyz".to_string());
+        t.add("[abcdefghijklmnopqrstuvwxyz]+", Kind::Word).unwrap();
+
+        let tokens: Vec<_> = t.lexer("hello").unwrap().collect::<Result<_, _>>().unwrap();
+
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0], (&Kind::Word, "hello"));
+    }
+
+    #[test]
+    fn lexer_empty_input() {
+        #[derive(Debug, Clone, PartialEq)]
+        enum Kind {
+            Number,
+        }
+
+        let mut t = Table::new("0123456789".to_string());
+        t.add("[0123456789]+", Kind::Number).unwrap();
+
+        let tokens: Vec<_> = t.lexer("").unwrap().collect::<Result<_, _>>().unwrap();
+
+        assert!(tokens.is_empty());
+    }
+
+    #[test]
+    fn lexer_manual_iteration() {
+        #[derive(Debug, Clone, PartialEq)]
+        enum Kind {
+            A,
+            B,
+        }
+
+        let mut t = Table::new("ab".to_string());
+        t.add("a", Kind::A).unwrap();
+        t.add("b", Kind::B).unwrap();
+
+        let mut iter = t.lexer("aba").unwrap();
+
+        let (kind, content) = iter.next().unwrap().unwrap();
+        assert_eq!(kind, &Kind::A);
+        assert_eq!(content, "a");
+
+        let (kind, content) = iter.next().unwrap().unwrap();
+        assert_eq!(kind, &Kind::B);
+        assert_eq!(content, "b");
+
+        let (kind, content) = iter.next().unwrap().unwrap();
+        assert_eq!(kind, &Kind::A);
+        assert_eq!(content, "a");
+
+        assert!(iter.next().is_none());
+    }
+
+    // ========================================================================
+    // LONGEST MATCH (MAXIMAL MUNCH)
+    // ========================================================================
+
+    #[test]
+    fn lexer_longest_match_numbers() {
+        #[derive(Debug, Clone, PartialEq)]
+        enum Kind {
+            Number,
+            Add,
+        }
+
+        let mut t = Table::new("0123456789+".to_string());
+        t.add("[0123456789]+", Kind::Number).unwrap();
+        t.add("+", Kind::Add).unwrap();
+
+        let tokens: Vec<_> = t
+            .lexer("123+456")
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+
+        assert_eq!(tokens.len(), 3);
+        assert_eq!(tokens[0], (&Kind::Number, "123"));
+        assert_eq!(tokens[1], (&Kind::Add, "+"));
+        assert_eq!(tokens[2], (&Kind::Number, "456"));
+    }
+
+    #[test]
+    fn lexer_longest_match_overlapping_literals() {
+        #[derive(Debug, Clone, PartialEq)]
+        enum Kind {
+            Eq,
+            EqEq,
+        }
+
+        let mut t = Table::new("=".to_string());
+        t.add("=", Kind::Eq).unwrap();
+        t.add("==", Kind::EqEq).unwrap();
+
+        // "==" should match as EqEq
+        let tokens: Vec<_> = t.lexer("==").unwrap().collect::<Result<_, _>>().unwrap();
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0], (&Kind::EqEq, "=="));
+
+        // "=" should match as Eq
+        let tokens: Vec<_> = t.lexer("=").unwrap().collect::<Result<_, _>>().unwrap();
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0], (&Kind::Eq, "="));
+
+        // "===" should be EqEq + Eq
+        let tokens: Vec<_> = t.lexer("===").unwrap().collect::<Result<_, _>>().unwrap();
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0], (&Kind::EqEq, "=="));
+        assert_eq!(tokens[1], (&Kind::Eq, "="));
+    }
+
+    #[test]
+    fn lexer_longest_match_backtrack() {
+        #[derive(Debug, Clone, PartialEq)]
+        enum Kind {
+            Ab,
+            Abc,
+            X,
+        }
+
+        let mut t = Table::new("abcx".to_string());
+        t.add("ab", Kind::Ab).unwrap();
+        t.add("abc", Kind::Abc).unwrap();
+        t.add("x", Kind::X).unwrap();
+
+        // "abx" - matches "ab" then "x" (not "abc" partial)
+        let tokens: Vec<_> = t.lexer("abx").unwrap().collect::<Result<_, _>>().unwrap();
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0], (&Kind::Ab, "ab"));
+        assert_eq!(tokens[1], (&Kind::X, "x"));
+    }
+
+    #[test]
+    fn lexer_longest_match_greedy() {
+        #[derive(Debug, Clone, PartialEq)]
+        enum Kind {
+            A,
+            Aa,
+            Aaa,
+        }
+
+        let mut t = Table::new("a".to_string());
+        t.add("a", Kind::A).unwrap();
+        t.add("aa", Kind::Aa).unwrap();
+        t.add("aaa", Kind::Aaa).unwrap();
+
+        let tokens: Vec<_> = t.lexer("aaa").unwrap().collect::<Result<_, _>>().unwrap();
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0], (&Kind::Aaa, "aaa"));
+
+        let tokens: Vec<_> = t.lexer("aaaa").unwrap().collect::<Result<_, _>>().unwrap();
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0], (&Kind::Aaa, "aaa"));
+        assert_eq!(tokens[1], (&Kind::A, "a"));
+
+        let tokens: Vec<_> = t.lexer("aaaaa").unwrap().collect::<Result<_, _>>().unwrap();
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0], (&Kind::Aaa, "aaa"));
+        assert_eq!(tokens[1], (&Kind::Aa, "aa"));
+    }
+
+    // ========================================================================
+    // ERROR HANDLING
+    // ========================================================================
+
+    #[test]
+    fn lexer_error_unknown_char_immediate() {
+        // Il lexer restituisce errore immediatamente quando incontra
+        // un carattere fuori dall'alfabeto, anche durante un match parziale
+        #[derive(Debug, Clone, PartialEq)]
+        enum Kind {
+            Number,
+        }
+
+        let mut t = Table::new("0123456789".to_string());
+        t.add("[0123456789]+", Kind::Number).unwrap();
+
+        let mut iter = t.lexer("12@34").unwrap();
+
+        // Errore immediato su '@', non restituisce "12" prima
+        let err = iter.next().unwrap().unwrap_err();
+        assert_eq!(
+            err,
+            LexerError::UnknownChar {
+                char: '@',
+                position: 2
+            }
+        );
+    }
+
+    #[test]
+    fn lexer_error_unknown_char_at_start() {
+        #[derive(Debug, Clone, PartialEq)]
+        enum Kind {
+            Number,
+        }
+
+        let mut t = Table::new("0123456789".to_string());
+        t.add("[0123456789]+", Kind::Number).unwrap();
+
+        let mut iter = t.lexer("@123").unwrap();
+
+        let err = iter.next().unwrap().unwrap_err();
+        assert_eq!(
+            err,
+            LexerError::UnknownChar {
+                char: '@',
+                position: 0
+            }
+        );
+    }
+
+    #[test]
+    fn lexer_error_unknown_char_after_valid_token() {
+        #[derive(Debug, Clone, PartialEq)]
+        enum Kind {
+            A,
+            B,
+        }
+
+        let mut t = Table::new("ab".to_string());
+        t.add("a", Kind::A).unwrap();
+        t.add("b", Kind::B).unwrap();
+
+        let mut iter = t.lexer("a@b").unwrap();
+
+        let err = iter.next().unwrap().unwrap_err();
+        assert_eq!(
+            err,
+            LexerError::UnknownChar {
+                char: '@',
+                position: 1
+            }
+        );
+    }
+
+    #[test]
+    fn lexer_error_unexpected_end_no_pattern() {
+        #[derive(Debug, Clone, PartialEq)]
+        enum Kind {
+            Abc,
+        }
+
+        let mut t = Table::new("abcdef".to_string());
+        t.add("abc", Kind::Abc).unwrap();
+
+        let mut iter = t.lexer("abcdef").unwrap();
+
+        // "abc" matches
+        let (kind, content) = iter.next().unwrap().unwrap();
+        assert_eq!(kind, &Kind::Abc);
+        assert_eq!(content, "abc");
+
+        // "def" is in alphabet but no pattern matches
+        let err = iter.next().unwrap().unwrap_err();
+        assert_eq!(err, LexerError::UnexpectedEnd { position: 3 });
+    }
+
+    #[test]
+    fn lexer_error_unexpected_end_at_start() {
+        #[derive(Debug, Clone, PartialEq)]
+        enum Kind {
+            Abc,
+        }
+
+        let mut t = Table::new("abcdef".to_string());
+        t.add("abc", Kind::Abc).unwrap();
+
+        let mut iter = t.lexer("def").unwrap();
+
+        // "def" starts with 'd' which has no transition from root
+        let err = iter.next().unwrap().unwrap_err();
+        assert_eq!(err, LexerError::UnexpectedEnd { position: 0 });
+    }
+
+    #[test]
+    fn lexer_error_invalid_string_non_ascii() {
+        #[derive(Debug, Clone, PartialEq)]
+        enum Kind {
+            Word,
+        }
+
+        let mut t = Table::new("abc".to_string());
+        t.add("[abc]+", Kind::Word).unwrap();
+
+        let result = t.lexer("héllo");
+        assert!(matches!(result, Err(LexerError::InvalidString(_))));
+    }
+
+    #[test]
+    fn lexer_error_invalid_string_emoji() {
+        #[derive(Debug, Clone, PartialEq)]
+        enum Kind {
+            Word,
+        }
+
+        let mut t = Table::new("abc".to_string());
+        t.add("[abc]+", Kind::Word).unwrap();
+
+        let result = t.lexer("abc😀");
+        assert!(matches!(result, Err(LexerError::InvalidString(_))));
+    }
+
+    // ========================================================================
+    // WHITESPACE HANDLING
+    // ========================================================================
+
+    #[test]
+    fn lexer_with_whitespace_in_alphabet() {
+        #[derive(Debug, Clone, PartialEq)]
+        enum Kind {
+            Number,
+            Space,
+        }
+
+        let mut t = Table::new("0123456789 ".to_string());
+        t.add("[0123456789]+", Kind::Number).unwrap();
+        t.add(" +", Kind::Space).unwrap();
+
+        let tokens: Vec<_> = t
+            .lexer("1 2  3")
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+
+        assert_eq!(tokens.len(), 5);
+        assert_eq!(tokens[0], (&Kind::Number, "1"));
+        assert_eq!(tokens[1], (&Kind::Space, " "));
+        assert_eq!(tokens[2], (&Kind::Number, "2"));
+        assert_eq!(tokens[3], (&Kind::Space, "  "));
+        assert_eq!(tokens[4], (&Kind::Number, "3"));
+    }
+
+    #[test]
+    fn lexer_whitespace_not_in_alphabet_immediate_error() {
+        // Errore immediato quando incontra spazio fuori alfabeto
+        #[derive(Debug, Clone, PartialEq)]
+        enum Kind {
+            Number,
+        }
+
+        let mut t = Table::new("0123456789".to_string());
+        t.add("[0123456789]+", Kind::Number).unwrap();
+
+        let mut iter = t.lexer("1 2").unwrap();
+
+        // Errore immediato, non restituisce "1" prima
+        let err = iter.next().unwrap().unwrap_err();
+        assert_eq!(
+            err,
+            LexerError::UnknownChar {
+                char: ' ',
+                position: 1
+            }
+        );
+    }
+
+    // ========================================================================
+    // COMPLEX PATTERNS
+    // ========================================================================
+
+    #[test]
+    fn lexer_identifier_and_numbers_separate_alphabets() {
+        // Usiamo alfabeti non sovrapposti per evitare ambiguità
+        #[derive(Debug, Clone, PartialEq)]
+        enum Kind {
+            Ident,
+            Number,
+            Eq,
+        }
+
+        let mut t = Table::new("abcxyz0123456789=".to_string());
+        t.add("[abcxyz]+", Kind::Ident).unwrap();
+        t.add("[0123456789]+", Kind::Number).unwrap();
+        t.add("=", Kind::Eq).unwrap();
+
+        let tokens: Vec<_> = t.lexer("x=42").unwrap().collect::<Result<_, _>>().unwrap();
+
+        assert_eq!(tokens.len(), 3);
+        assert_eq!(tokens[0], (&Kind::Ident, "x"));
+        assert_eq!(tokens[1], (&Kind::Eq, "="));
+        assert_eq!(tokens[2], (&Kind::Number, "42"));
+    }
+
+    #[test]
+    fn lexer_multiple_operators() {
+        #[derive(Debug, Clone, PartialEq)]
+        enum Kind {
+            Lt,
+            Le,
+            Gt,
+            Ge,
+            Eq,
+            EqEq,
+            Not,
+            Ne,
+        }
+
+        let mut t = Table::new("<=!>".to_string());
+        t.add("<", Kind::Lt).unwrap();
+        t.add("<=", Kind::Le).unwrap();
+        t.add(">", Kind::Gt).unwrap();
+        t.add(">=", Kind::Ge).unwrap();
+        t.add("=", Kind::Eq).unwrap();
+        t.add("==", Kind::EqEq).unwrap();
+        t.add("!", Kind::Not).unwrap();
+        t.add("!=", Kind::Ne).unwrap();
+
+        let tokens: Vec<_> = t
+            .lexer("<=>=!===!=")
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+
+        assert_eq!(tokens.len(), 5);
+        assert_eq!(tokens[0], (&Kind::Le, "<="));
+        assert_eq!(tokens[1], (&Kind::Ge, ">="));
+        assert_eq!(tokens[2], (&Kind::Ne, "!="));
+        assert_eq!(tokens[3], (&Kind::EqEq, "=="));
+        assert_eq!(tokens[4], (&Kind::Ne, "!="));
+    }
+
+    #[test]
+    fn lexer_hex_numbers() {
+        #[derive(Debug, Clone, PartialEq)]
+        enum Kind {
+            Hex,
+        }
+
+        let mut t = Table::new("0123456789abcdef".to_string());
+        t.add("[0123456789abcdef]+", Kind::Hex).unwrap();
+
+        let tokens: Vec<_> = t
+            .lexer("deadbeef")
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0], (&Kind::Hex, "deadbeef"));
+    }
+
+    // ========================================================================
+    // EDGE CASES
+    // ========================================================================
+
+    #[test]
+    fn lexer_single_char_tokens() {
+        #[derive(Debug, Clone, PartialEq)]
+        enum Kind {
+            A,
+        }
+
+        let mut t = Table::new("a".to_string());
+        t.add("a", Kind::A).unwrap();
+
+        let tokens: Vec<_> = t.lexer("aaa").unwrap().collect::<Result<_, _>>().unwrap();
+
+        assert_eq!(tokens.len(), 3);
+        assert_eq!(tokens[0], (&Kind::A, "a"));
+        assert_eq!(tokens[1], (&Kind::A, "a"));
+        assert_eq!(tokens[2], (&Kind::A, "a"));
+    }
+
+    #[test]
+    fn lexer_very_long_token() {
+        #[derive(Debug, Clone, PartialEq)]
+        enum Kind {
+            A,
+        }
+
+        let mut t = Table::new("a".to_string());
+        t.add("a+", Kind::A).unwrap();
+
+        let long_input = "a".repeat(10000);
+        let tokens: Vec<_> = t
+            .lexer(&long_input)
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].0, &Kind::A);
+        assert_eq!(tokens[0].1.len(), 10000);
+    }
+
+    #[test]
+    fn lexer_alternating_tokens() {
+        #[derive(Debug, Clone, PartialEq)]
+        enum Kind {
+            A,
+            B,
+        }
+
+        let mut t = Table::new("ab".to_string());
+        t.add("a+", Kind::A).unwrap();
+        t.add("b+", Kind::B).unwrap();
+
+        let tokens: Vec<_> = t
+            .lexer("aaabbbaaab")
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+
+        assert_eq!(tokens.len(), 4);
+        assert_eq!(tokens[0], (&Kind::A, "aaa"));
+        assert_eq!(tokens[1], (&Kind::B, "bbb"));
+        assert_eq!(tokens[2], (&Kind::A, "aaa"));
+        assert_eq!(tokens[3], (&Kind::B, "b"));
+    }
+
+    #[test]
+    fn lexer_partial_match_at_end() {
+        #[derive(Debug, Clone, PartialEq)]
+        enum Kind {
+            Abc,
+        }
+
+        let mut t = Table::new("abc".to_string());
+        t.add("abc", Kind::Abc).unwrap();
+
+        // "abcab" - first "abc" matches, then "ab" is partial with no match
+        let mut iter = t.lexer("abcab").unwrap();
+
+        let (kind, content) = iter.next().unwrap().unwrap();
+        assert_eq!(kind, &Kind::Abc);
+        assert_eq!(content, "abc");
+
+        // "ab" has no complete match
+        let err = iter.next().unwrap().unwrap_err();
+        assert_eq!(err, LexerError::UnexpectedEnd { position: 3 });
+    }
+
+    #[test]
+    fn lexer_empty_table() {
+        #[derive(Debug, Clone, PartialEq)]
+        enum Kind {}
+
+        let t: Table<Kind> = Table::new("abc".to_string());
+
+        let mut iter = t.lexer("abc").unwrap();
+
+        // No patterns defined, should fail immediately
+        let err = iter.next().unwrap().unwrap_err();
+        assert_eq!(err, LexerError::UnexpectedEnd { position: 0 });
+    }
+
+    #[test]
+    fn lexer_collect_result_success() {
+        #[derive(Debug, Clone, PartialEq)]
+        enum Kind {
+            Num,
+            Op,
+        }
+
+        let mut t = Table::new("0123456789+".to_string());
+        t.add("[0123456789]+", Kind::Num).unwrap();
+        t.add("+", Kind::Op).unwrap();
+
+        let result: Result<Vec<_>, _> = t.lexer("1+2").unwrap().collect();
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 3);
+    }
+
+    #[test]
+    fn lexer_collect_result_failure() {
+        #[derive(Debug, Clone, PartialEq)]
+        enum Kind {
+            Num,
+            Op,
+        }
+
+        let mut t = Table::new("0123456789+".to_string());
+        t.add("[0123456789]+", Kind::Num).unwrap();
+        t.add("+", Kind::Op).unwrap();
+
+        let result: Result<Vec<_>, _> = t.lexer("1@2").unwrap().collect();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn lexer_only_repetition() {
+        #[derive(Debug, Clone, PartialEq)]
+        enum Kind {
+            Stars,
+        }
+
+        let mut t = Table::new("*".to_string());
+        t.add("*+", Kind::Stars).unwrap();
+
+        let tokens: Vec<_> = t.lexer("****").unwrap().collect::<Result<_, _>>().unwrap();
+
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0], (&Kind::Stars, "****"));
+    }
+
+    #[test]
+    fn lexer_mixed_fixed_and_repetition() {
+        #[derive(Debug, Clone, PartialEq)]
+        enum Kind {
+            Prefix,
+            Suffix,
+        }
+
+        let mut t = Table::new("ab".to_string());
+        t.add("a+b", Kind::Prefix).unwrap(); // one or more 'a' followed by 'b'
+
+        let tokens: Vec<_> = t.lexer("aaab").unwrap().collect::<Result<_, _>>().unwrap();
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0], (&Kind::Prefix, "aaab"));
+
+        let tokens: Vec<_> = t.lexer("ab").unwrap().collect::<Result<_, _>>().unwrap();
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0], (&Kind::Prefix, "ab"));
+    }
+
+    // ========================================================================
+    // REAL-WORLD SCENARIOS
+    // ========================================================================
+
+    #[test]
+    fn lexer_arithmetic_expression() {
+        #[derive(Debug, Clone, PartialEq)]
+        enum Kind {
+            Num,
+            Add,
+            Sub,
+            Mul,
+            Div,
+            LParen,
+            RParen,
+        }
+
+        let mut t = Table::new("0123456789+-*/()".to_string());
+        t.add("[0123456789]+", Kind::Num).unwrap();
+        t.add("+", Kind::Add).unwrap();
+        t.add("-", Kind::Sub).unwrap();
+        t.add("*", Kind::Mul).unwrap();
+        t.add("/", Kind::Div).unwrap();
+        t.add("(", Kind::LParen).unwrap();
+        t.add(")", Kind::RParen).unwrap();
+
+        let tokens: Vec<_> = t
+            .lexer("(1+2)*3")
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+
+        assert_eq!(tokens.len(), 7);
+        assert_eq!(tokens[0], (&Kind::LParen, "("));
+        assert_eq!(tokens[1], (&Kind::Num, "1"));
+        assert_eq!(tokens[2], (&Kind::Add, "+"));
+        assert_eq!(tokens[3], (&Kind::Num, "2"));
+        assert_eq!(tokens[4], (&Kind::RParen, ")"));
+        assert_eq!(tokens[5], (&Kind::Mul, "*"));
+        assert_eq!(tokens[6], (&Kind::Num, "3"));
+    }
+
+    #[test]
+    fn lexer_complex_arithmetic() {
+        #[derive(Debug, Clone, PartialEq)]
+        enum Kind {
+            Num,
+            Add,
+            Sub,
+            Mul,
+            Div,
+            LParen,
+            RParen,
+        }
+
+        let mut t = Table::new("0123456789+-*/()".to_string());
+        t.add("[0123456789]+", Kind::Num).unwrap();
+        t.add("+", Kind::Add).unwrap();
+        t.add("-", Kind::Sub).unwrap();
+        t.add("*", Kind::Mul).unwrap();
+        t.add("/", Kind::Div).unwrap();
+        t.add("(", Kind::LParen).unwrap();
+        t.add(")", Kind::RParen).unwrap();
+
+        let tokens: Vec<_> = t
+            .lexer("((10+20)*(30-5))/2")
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+
+        assert_eq!(tokens.len(), 15);
+        assert_eq!(tokens[0], (&Kind::LParen, "("));
+        assert_eq!(tokens[1], (&Kind::LParen, "("));
+        assert_eq!(tokens[2], (&Kind::Num, "10"));
+        assert_eq!(tokens[3], (&Kind::Add, "+"));
+        assert_eq!(tokens[4], (&Kind::Num, "20"));
+        assert_eq!(tokens[5], (&Kind::RParen, ")"));
+        assert_eq!(tokens[6], (&Kind::Mul, "*"));
+        assert_eq!(tokens[7], (&Kind::LParen, "("));
+        assert_eq!(tokens[8], (&Kind::Num, "30"));
+        assert_eq!(tokens[9], (&Kind::Sub, "-"));
+        assert_eq!(tokens[10], (&Kind::Num, "5"));
+        assert_eq!(tokens[11], (&Kind::RParen, ")"));
+        assert_eq!(tokens[12], (&Kind::RParen, ")"));
+        assert_eq!(tokens[13], (&Kind::Div, "/"));
+        assert_eq!(tokens[14], (&Kind::Num, "2"));
+    }
+
+    #[test]
+    fn lexer_simple_tokens_no_overlap() {
+        // Semplice scenario senza ambiguità
+        #[derive(Debug, Clone, PartialEq)]
+        enum Kind {
+            LBrace,
+            RBrace,
+            Comma,
+            Colon,
+            Num,
+        }
+
+        let mut t = Table::new("{},:0123456789".to_string());
+        t.add("{", Kind::LBrace).unwrap();
+        t.add("}", Kind::RBrace).unwrap();
+        t.add(",", Kind::Comma).unwrap();
+        t.add(":", Kind::Colon).unwrap();
+        t.add("[0123456789]+", Kind::Num).unwrap();
+
+        let tokens: Vec<_> = t
+            .lexer("{1:2,3:4}")
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+
+        assert_eq!(tokens.len(), 9);
+        assert_eq!(tokens[0], (&Kind::LBrace, "{"));
+        assert_eq!(tokens[1], (&Kind::Num, "1"));
+        assert_eq!(tokens[2], (&Kind::Colon, ":"));
+        assert_eq!(tokens[3], (&Kind::Num, "2"));
+        assert_eq!(tokens[4], (&Kind::Comma, ","));
+        assert_eq!(tokens[5], (&Kind::Num, "3"));
+        assert_eq!(tokens[6], (&Kind::Colon, ":"));
+        assert_eq!(tokens[7], (&Kind::Num, "4"));
+        assert_eq!(tokens[8], (&Kind::RBrace, "}"));
+    }
+
+    #[test]
+    fn lexer_position_tracking() {
+        // Verifica che le posizioni negli errori siano corrette
+        #[derive(Debug, Clone, PartialEq)]
+        enum Kind {
+            A,
+        }
+
+        let mut t = Table::new("a".to_string());
+        t.add("a", Kind::A).unwrap();
+
+        // Errore a posizione 5
+        let mut iter = t.lexer("aaaaa@").unwrap();
+
+        for _ in 0..4 {
+            assert!(iter.next().unwrap().is_ok());
+        }
+
+        let err = iter.next().unwrap().unwrap_err();
+        assert_eq!(
+            err,
+            LexerError::UnknownChar {
+                char: '@',
+                position: 5
+            }
+        );
     }
 }

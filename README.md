@@ -1,10 +1,11 @@
 # mtable
 
-A fast and efficient Rust library for pattern matching based on trie data structures. Ideal for building lexers, tokenizers, and command parsers.
+A fast and efficient Rust library for pattern matching and lexical analysis based on trie data structures. Build high-performance lexers and tokenizers with ease.
 
 ## Features
 
 - 🚀 **Fast**: Built on an optimized trie structure with O(n) lookup time
+- 🔍 **Full Tokenization**: Built-in lexer with longest-match (maximal munch) strategy
 - 🎯 **Pattern Matching**: Supports literal patterns, character classes `[abc]`, and repetitions `+`
 - 🔤 **Customizable Alphabet**: Define your own set of valid characters
 - 🎨 **Generic**: Works with any type `T: Clone + Debug` (enums, integers, structs)
@@ -13,27 +14,57 @@ A fast and efficient Rust library for pattern matching based on trie data struct
 
 ## Quick Start
 
+### Pattern Matching
+
 ```rust
 use mtable::Table;
 
 #[derive(Debug, Clone, PartialEq)]
 enum TokenType {
     Keyword,
-    Operator,
     Identifier,
 }
 
-let mut lexer = Table::new("abcdefghijklmnopqrstuvwxyz".to_string());
+let mut table = Table::new("abcdefghijklmnopqrstuvwxyz".to_string());
 
-// Map keywords to token types
-lexer.add("if", TokenType::Keyword).unwrap();
-lexer.add("while", TokenType::Keyword).unwrap();
-lexer.add("return", TokenType::Keyword).unwrap();
+table.add("if", TokenType::Keyword).unwrap();
+table.add("while", TokenType::Keyword).unwrap();
 
-// Check tokens
-assert_eq!(lexer.get("if").unwrap(), Some(&TokenType::Keyword));
-assert_eq!(lexer.get("while").unwrap(), Some(&TokenType::Keyword));
-assert_eq!(lexer.get("other").unwrap(), None);
+// Single pattern matching
+assert_eq!(table.get("if").unwrap(), Some(&TokenType::Keyword));
+assert_eq!(table.get("other").unwrap(), None);
+```
+
+### Tokenization (Lexer)
+
+```rust
+use mtable::Table;
+
+#[derive(Debug, Clone, PartialEq)]
+enum Token {
+    Number,
+    Plus,
+    Multiply,
+}
+
+let mut lexer = Table::new("0123456789+*".to_string());
+
+lexer.add("[0123456789]+", Token::Number).unwrap();
+lexer.add("+", Token::Plus).unwrap();
+lexer.add("*", Token::Multiply).unwrap();
+
+// Tokenize entire expression
+let tokens: Vec<_> = lexer.lexer("123+456*789")
+    .unwrap()
+    .collect::<Result<_, _>>()
+    .unwrap();
+
+assert_eq!(tokens.len(), 5);
+assert_eq!(tokens[0], (&Token::Number, "123"));
+assert_eq!(tokens[1], (&Token::Plus, "+"));
+assert_eq!(tokens[2], (&Token::Number, "456"));
+assert_eq!(tokens[3], (&Token::Multiply, "*"));
+assert_eq!(tokens[4], (&Token::Number, "789"));
 ```
 
 ## Pattern Syntax
@@ -94,9 +125,97 @@ assert_eq!(table.get("42").unwrap(), Some(&TokenType::Number));
 assert_eq!(table.get("123456").unwrap(), Some(&TokenType::Number));
 ```
 
+## Lexer / Tokenizer
+
+The `lexer()` method creates an iterator that tokenizes an entire input string using the **longest match** (maximal munch) strategy.
+
+### Basic Usage
+
+```rust
+#[derive(Debug, Clone, PartialEq)]
+enum Token {
+    Num,
+    Add,
+    Sub,
+}
+
+let mut table = Table::new("0123456789+-".to_string());
+table.add("[0123456789]+", Token::Num).unwrap();
+table.add("+", Token::Add).unwrap();
+table.add("-", Token::Sub).unwrap();
+
+// Create lexer iterator
+for result in table.lexer("12+34-56").unwrap() {
+    let (token, content) = result.unwrap();
+    println!("{:?}: {}", token, content);
+}
+
+// Or collect all tokens at once
+let tokens: Vec<_> = table.lexer("12+34")
+    .unwrap()
+    .collect::<Result<_, _>>()
+    .unwrap();
+```
+
+### Longest Match (Maximal Munch)
+
+The lexer always chooses the longest possible match:
+
+```rust
+#[derive(Debug, Clone, PartialEq)]
+enum Token {
+    Eq,      // =
+    EqEq,    // ==
+}
+
+let mut table = Table::new("=".to_string());
+table.add("=", Token::Eq).unwrap();
+table.add("==", Token::EqEq).unwrap();
+
+let tokens: Vec<_> = table.lexer("===")
+    .unwrap()
+    .collect::<Result<_, _>>()
+    .unwrap();
+
+// Results in [EqEq("=="), Eq("=")]
+// Not [Eq("="), Eq("="), Eq("=")]
+assert_eq!(tokens[0], (&Token::EqEq, "=="));
+assert_eq!(tokens[1], (&Token::Eq, "="));
+```
+
+### Error Handling in Lexer
+
+The lexer can return two types of errors:
+
+```rust
+use mtable::LexerError;
+
+#[derive(Debug, Clone, PartialEq)]
+enum Token { Number }
+
+let mut table = Table::new("0123456789".to_string());
+table.add("[0123456789]+", Token::Number).unwrap();
+
+// Unknown character
+match table.lexer("12@34").unwrap().next() {
+    Some(Err(LexerError::UnknownChar { char, position })) => {
+        println!("Unknown char '{}' at position {}", char, position);
+    }
+    _ => {}
+}
+
+// No pattern matches
+match table.lexer("abc").unwrap().next() {
+    Some(Err(LexerError::UnexpectedEnd { position })) => {
+        println!("No match at position {}", position);
+    }
+    _ => {}
+}
+```
+
 ## Real-World Examples
 
-### Lexer for Programming Language
+### Complete Programming Language Lexer
 
 ```rust
 #[derive(Debug, Clone, PartialEq)]
@@ -115,13 +234,15 @@ enum TokenType {
     Plus,
     Minus,
     Assign,
+    LParen,
+    RParen,
 }
 
 let mut lexer = Table::new(
-    "abcdefghijklmnopqrstuvwxyz0123456789+-=".to_string()
+    "abcdefghijklmnopqrstuvwxyz0123456789+-=()".to_string()
 );
 
-// Keywords
+// Keywords (must be added before identifier pattern)
 lexer.add("if", TokenType::If).unwrap();
 lexer.add("else", TokenType::Else).unwrap();
 lexer.add("while", TokenType::While).unwrap();
@@ -140,12 +261,30 @@ lexer.add("[0123456789]+", TokenType::Number).unwrap();
 lexer.add("+", TokenType::Plus).unwrap();
 lexer.add("-", TokenType::Minus).unwrap();
 lexer.add("=", TokenType::Assign).unwrap();
+lexer.add("(", TokenType::LParen).unwrap();
+lexer.add(")", TokenType::RParen).unwrap();
 
-// Usage
-assert_eq!(lexer.get("if").unwrap(), Some(&TokenType::If));
-assert_eq!(lexer.get("var123").unwrap(), Some(&TokenType::Identifier));
-assert_eq!(lexer.get("42").unwrap(), Some(&TokenType::Number));
-assert_eq!(lexer.get("+").unwrap(), Some(&TokenType::Plus));
+// Tokenize source code
+let source = "if(x=42)return(x+1)";
+let tokens: Vec<_> = lexer.lexer(source)
+    .unwrap()
+    .map(|r| r.unwrap().0.clone())
+    .collect();
+
+assert_eq!(tokens, vec![
+    TokenType::If,
+    TokenType::LParen,
+    TokenType::Identifier,
+    TokenType::Assign,
+    TokenType::Number,
+    TokenType::RParen,
+    TokenType::Return,
+    TokenType::LParen,
+    TokenType::Identifier,
+    TokenType::Plus,
+    TokenType::Number,
+    TokenType::RParen,
+]);
 ```
 
 ### HTTP Method Router with Numeric IDs
@@ -170,6 +309,48 @@ match router.get("post").unwrap() {
     Some(&POST) => println!("Handle POST request"),
     Some(&GET) => println!("Handle GET request"),
     _ => println!("Unknown method"),
+}
+```
+
+### Arithmetic Expression Lexer
+
+```rust
+#[derive(Debug, Clone, PartialEq)]
+enum Token {
+    Number,
+    Plus,
+    Minus,
+    Multiply,
+    Divide,
+    LParen,
+    RParen,
+}
+
+let mut lexer = Table::new("0123456789+-*/()".to_string());
+
+lexer.add("[0123456789]+", Token::Number).unwrap();
+lexer.add("+", Token::Plus).unwrap();
+lexer.add("-", Token::Minus).unwrap();
+lexer.add("*", Token::Multiply).unwrap();
+lexer.add("/", Token::Divide).unwrap();
+lexer.add("(", Token::LParen).unwrap();
+lexer.add(")", Token::RParen).unwrap();
+
+// Parse complex expression
+let expr = "(100+50)*2-10/5";
+let tokens: Vec<_> = lexer.lexer(expr)
+    .unwrap()
+    .collect::<Result<_, _>>()
+    .unwrap();
+
+// Can be used to build an AST or evaluate directly
+for (token, text) in &tokens {
+    match token {
+        Token::Number => println!("NUM: {}", text),
+        Token::Plus => println!("OP: +"),
+        Token::Multiply => println!("OP: *"),
+        _ => println!("TOKEN: {:?}", token),
+    }
 }
 ```
 
@@ -339,13 +520,47 @@ match table.get("if").unwrap() {
 }
 ```
 
+### `Table::lexer<'a>(&'a self, s: &'a str) -> Result<TableIterator<'a, T>, LexerError>`
+
+Creates an iterator that tokenizes the entire input string using longest-match strategy. Returns:
+- `Ok(iterator)` that yields `Result<(&T, &str), LexerError>` for each token
+- `Err(LexerError::InvalidString)` if the input contains non-ASCII characters
+
+```rust
+// Iterate through tokens
+for result in table.lexer("input string").unwrap() {
+    match result {
+        Ok((token, text)) => println!("{:?}: {}", token, text),
+        Err(e) => eprintln!("Lexer error: {}", e),
+    }
+}
+
+// Collect all tokens
+let tokens: Vec<_> = table.lexer("input")
+    .unwrap()
+    .collect::<Result<_, _>>()
+    .unwrap();
+```
+
+**Lexer Errors:**
+- `LexerError::UnknownChar { char, position }` - Character not in alphabet
+- `LexerError::UnexpectedEnd { position }` - No pattern matches at this position
+- `LexerError::InvalidString(String)` - Input contains non-ASCII characters
+```
+
 ## Performance
 
 The implementation uses a trie (prefix tree) data structure which provides:
 
-- **Insertion**: O(m) where m is the pattern length
-- **Lookup**: O(n) where n is the query string length
-- **Memory**: Efficient prefix sharing between patterns
+- **Pattern insertion**: O(m) where m is the pattern length
+- **Single match lookup**: O(n) where n is the query string length
+- **Lexer tokenization**: O(n) where n is the input string length
+- **Memory**: Efficient prefix sharing between patterns, O(k) where k is total pattern size
+
+The lexer uses **longest-match (maximal munch)** strategy with backtracking:
+- Explores paths greedily, storing potential matches
+- Backtracks to last valid match when no further transitions exist
+- Single-pass tokenization with minimal overhead
 
 ## Limitations
 
@@ -359,32 +574,36 @@ The implementation uses a trie (prefix tree) data structure which provides:
 
 Features planned for future releases:
 
-- 🔜 **Substring Matching**: Find patterns anywhere in the input string, not just exact matches
-- 🔜 **Multiple Match Results**: Return all matching patterns in a string
 - 💭 **Optional Operator `?`**: Match zero or one occurrence
-- 💭 **Kleene Star `*`**: Match zero or more occurrences
+- 💭 **Kleene Star `*`**: Match zero or more occurrences  
 - 💭 **Range Syntax**: Support `[a-z]` and `[0-9]` notation in character classes
-- 💭 **Match Position Info**: Return start/end positions of matches
+- 💭 **Negation in Classes**: Support `[^abc]` to match anything except specified characters
+- 💭 **Unicode Support**: Extend beyond ASCII to support UTF-8 strings
 
 ## Use Cases
 
 `mtable` is ideal for:
 
-- ✅ **Lexical analysis**: Tokenizing source code or input
-- ✅ **Command parsing**: Matching commands in CLI tools or protocols
-- ✅ **Configuration parsing**: Recognizing configuration keys
-- ✅ **Protocol parsers**: Matching protocol keywords or message types
-- ✅ **Simple routing**: Mapping strings to handlers or IDs
-- ✅ **Domain-specific languages**: Pattern matching for custom syntax
+- ✅ **Lexical analysis**: Full tokenization of source code with longest-match strategy
+- ✅ **Expression parsers**: Tokenize mathematical or logical expressions
+- ✅ **Command parsing**: Parse CLI commands and arguments
+- ✅ **Configuration parsing**: Tokenize configuration files
+- ✅ **Protocol parsers**: Tokenize protocol messages and commands
+- ✅ **Data format parsers**: CSV, TSV, and simple structured formats
+- ✅ **Simple compilers**: Frontend lexical analysis for DSLs
 
-**Current version is best for:**
-- Exact pattern matching from beginning to end of string
-- Single-pass tokenization
-- Fixed vocabulary recognition
+**Strengths:**
+- Fast single-pass tokenization
+- Predictable longest-match behavior
+- Type-safe token representation
+- Zero-copy string references in tokens
+- Detailed error reporting with positions
 
 **Not suitable for:**
 - ❌ Complex regular expressions (use [regex](https://crates.io/crates/regex) crate)
-- ❌ Unicode text processing
+- ❌ Unicode text processing (ASCII only)
+- ❌ Context-sensitive parsing (use a proper parser)
+- ❌ Patterns requiring lookahead/lookbehind
 
 ## Contributing
 

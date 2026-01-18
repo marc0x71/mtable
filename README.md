@@ -546,7 +546,6 @@ let tokens: Vec<_> = table.lexer("input")
 - `LexerError::UnknownChar { char, position }` - Character not in alphabet
 - `LexerError::UnexpectedEnd { position }` - No pattern matches at this position
 - `LexerError::InvalidString(String)` - Input contains non-ASCII characters
-```
 
 ## Performance
 
